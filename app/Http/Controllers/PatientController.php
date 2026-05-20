@@ -7,10 +7,34 @@ use Illuminate\Http\Request;
 
 class PatientController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
-        $patients = Patient::latest()->get();
-        return view('patients.index', compact('patients'));
+        $allowedSortFields = ['id', 'name', 'email', 'phone', 'date_of_birth', 'gender'];
+        $sortBy = $request->input('sort_by', 'id');
+        $sortOrder = $request->input('sort_order', 'desc');
+
+        if (!in_array($sortBy, $allowedSortFields)) {
+            $sortBy = 'id';
+        }
+        if (!in_array($sortOrder, ['asc', 'desc'])) {
+            $sortOrder = 'desc';
+        }
+
+        $search = $request->input('search', '');
+        $query = Patient::query();
+
+        if ($search) {
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('email', 'like', "%{$search}%")
+                  ->orWhere('phone', 'like', "%{$search}%")
+                  ->orWhere('address', 'like', "%{$search}%");
+            });
+        }
+
+        $patients = $query->orderBy($sortBy, $sortOrder)->paginate(10)->withQueryString();
+
+        return view('patients.index', compact('patients', 'sortBy', 'sortOrder', 'search'));
     }
 
     public function create()

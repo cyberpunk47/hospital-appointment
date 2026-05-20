@@ -3,101 +3,99 @@
 namespace App\Http\Controllers;
 
 use App\Models\Doctor;
-use App\Services\NmcApiService;
+use App\Models\Patient;
+use App\Models\Appointment;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
-
+use Carbon\Carbon;
 class NmcSearchController extends Controller
 {
     public function index(Request $request)
     {
-        $name = $request->input('name', '');
-        $smc = $request->input('smc', '');
-        $page = max(1, (int) $request->input('page', 1));
-        $perPage = 15;
-        $start = ($page - 1) * $perPage;
+        $specialization = $request->input('specialization', '');
+        $state = $request->input('state', '');
+        $city = $request->input('city', '');
+        $date = $request->input('date', Carbon::today()->toDateString());
+        
+        $specializations = Doctor::distinct()->whereNotNull('specialization')->pluck('specialization')->toArray();
+        $statesAndCities = config('indian_cities', []);
+        
+        $searching = $request->has('search') || $specialization || $state || $city;
+        
+        $allowedSortFields = ['name', 'specialization', 'city', 'daily_limit', 'start_time'];
+        $sortBy = $request->input('sort_by', 'name');
+        $sortOrder = $request->input('sort_order', 'asc');
 
-        $doctors = [];
-        $total = 0;
-        $apiError = false;
-        $usingFallback = false;
-        $smcList = NmcApiService::getSmcList();
-
-        // Only call API if user initiated a search OR is browsing (page > 1)
-        $searching = $request->has('search') || $page > 1;
-
-        if ($searching) {
-            try {
-                $service = new NmcApiService();
-                $result = $service->searchDoctors($start, $perPage);
-                $allDoctors = $result['doctors'];
-                $total = $result['total'];
-
-                // Client-side filtering since NMC API doesn't support filters on getPaginatedData
-                if ($name || $smc) {
-                    // For filtered searches, fetch a larger batch and filter client-side
-                    // This is a tradeoff — NMC doesn't support server-side name/smc filtering
-                    // on the paginated endpoint
-                    $filteredDoctors = collect($allDoctors);
-
-                    if ($name) {
-                        $filteredDoctors = $filteredDoctors->filter(function ($doc) use ($name) {
-                            return stripos($doc['name'], $name) !== false;
-                        });
-                    }
-
-                    if ($smc) {
-                        $filteredDoctors = $filteredDoctors->filter(function ($doc) use ($smc, $smcList) {
-                            $smcName = $smcList[(int) $smc] ?? '';
-                            return stripos($doc['state_medical_council'], $smcName) !== false;
-                        });
-                    }
-
-                    $doctors = $filteredDoctors->values()->all();
-                    // When filtering, we can't know exact total from API
-                    $total = count($doctors) > 0 ? $total : 0;
-                } else {
-                    $doctors = $allDoctors;
-                }
-            } catch (\Exception $e) {
-                Log::warning('NMC API failed, using fallback: ' . $e->getMessage());
-                $apiError = true;
-                $usingFallback = true;
-
-                // Fallback to local doctors
-                $query = Doctor::query();
-                if ($name) {
-                    $query->where('name', 'like', "%{$name}%");
-                }
-                $localDoctors = $query->latest()->get();
-
-                // Convert local doctors to same format as NMC
-                $doctors = $localDoctors->map(function ($doc) {
-                    return [
-                        'row_num' => $doc->id,
-                        'year' => $doc->created_at?->year ?? '—',
-                        'registration_number' => 'LOCAL-' . $doc->id,
-                        'state_medical_council' => 'Local Directory',
-                        'name' => $doc->name,
-                        'father_name' => '',
-                        'doctor_id' => '',
-                        'profile_url' => '',
-                        'specialization' => $doc->specialization,
-                        'availability' => $doc->availability,
-                        'email' => $doc->email,
-                        'phone' => $doc->phone,
-                    ];
-                })->all();
-                $total = count($doctors);
-            }
+        if (!in_array($sortBy, $allowedSortFields)) {
+            $sortBy = 'name';
+        }
+        if (!in_array($sortOrder, ['asc', 'desc'])) {
+            $sortOrder = 'asc';
         }
 
-        $totalPages = $total > 0 ? ceil($total / $perPage) : 1;
+        $query = Doctor::query();
+        
+        if ($specialization) {
+            $query->where('specialization', $specialization);
+        }
+        if ($state) {
+            $query->where('state', $state);
+        }
+        if ($city) {
+            $query->where('city', $city);
+        }
+        
+        $doctors = $query->orderBy($sortBy, $sortOrder)->paginate(6)->withQueryString();
+        
+        // Enhance each doctor with timings and remaining slots on the selected date
+        $doctors->getCollection()->transform(function ($doc) use ($date) {
+            $bookedCount = Appointment::where('doctor_id', $doc->id)
+                ->where('appointment_date', $date)
+                ->where('status', '!=', 'Cancelled')
+                ->count();
+                
+            $doc->booked_count = $bookedCount;
+            $doc->slots_remaining = max(0, $doc->daily_limit - $bookedCount);
+            
+            // Format timings for display
+            try {
+                $start = Carbon::createFromFormat('H:i:s', $doc->start_time)->format('h:i A');
+            } catch (\Exception $e) {
+                try {
+                    $start = Carbon::createFromFormat('H:i', $doc->start_time)->format('h:i A');
+                } catch (\Exception $ex) {
+                    $start = $doc->start_time;
+                }
+            }
 
+            try {
+                $end = Carbon::createFromFormat('H:i:s', $doc->end_time)->format('h:i A');
+            } catch (\Exception $e) {
+                try {
+                    $end = Carbon::createFromFormat('H:i', $doc->end_time)->format('h:i A');
+                } catch (\Exception $ex) {
+                    $end = $doc->end_time;
+                }
+            }
+
+            $doc->formatted_timings = "$start - $end";
+            
+            return $doc;
+        });
+        
+        $patients = Patient::orderBy('name')->get();
+        
         return view('nmc.search', compact(
-            'doctors', 'total', 'page', 'totalPages', 'perPage',
-            'name', 'smc', 'smcList', 'searching',
-            'apiError', 'usingFallback'
+            'doctors',
+            'specialization',
+            'state',
+            'city',
+            'date',
+            'specializations',
+            'statesAndCities',
+            'searching',
+            'patients',
+            'sortBy',
+            'sortOrder'
         ));
     }
 }
